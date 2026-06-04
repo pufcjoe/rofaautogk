@@ -36,10 +36,12 @@ local Settings = {
     ReactionTimeMin = 150,
     ReactionTimeMax = 200,
 
+    -- Jump Settings
     AutoJumpEnabled = false,
-    JumpThreshold = 7,
     JumpCooldown = 1.5,
-    JumpAnticipation = 0.3,
+    PlayerStandingReach = 7.5,
+    PlayerJumpReach = 13.0,
+    JumpRiseTime = 0.4,
 
     AwayGoalPosX = 0,
     AwayGoalPosY = 5.3,
@@ -155,18 +157,62 @@ local function triggerJump()
 end
 
 -- ═══════════════════════════════════════════════════════════
+--  JUMP DETECTION ALGORITHM
+-- ═══════════════════════════════════════════════════════════
+
+local function getJumpNecessity(impactY, timeToImpact)
+    local standingReach = Settings.PlayerStandingReach
+    local jumpReach     = Settings.PlayerJumpReach
+    local riseTime      = Settings.JumpRiseTime
+
+    -- Below standing reach: no jump needed
+    if impactY <= standingReach then return "none" end
+
+    -- Above jump reach entirely: unreachable
+    if impactY > jumpReach then return "unreachable" end
+
+    -- Ball is in jump range — check timing
+    local idealJumpWindow = timeToImpact - riseTime
+    if idealJumpWindow < -0.1 then return "too_late" end
+    if idealJumpWindow > 1.2  then return "too_early" end
+
+    -- Higher impact Y needs jump earlier so we're near peak when ball arrives
+    local heightFraction  = (impactY - standingReach) / (jumpReach - standingReach)
+    local neededLeadTime  = heightFraction * riseTime
+
+    if timeToImpact >= neededLeadTime and timeToImpact <= neededLeadTime + 0.5 then
+        return "jump_now"
+    elseif timeToImpact > neededLeadTime + 0.5 then
+        return "too_early"
+    else
+        return "too_late"
+    end
+end
+
+local function evaluateJump(impact, timeToImpact)
+    if not Settings.AutoJumpEnabled then return "disabled" end
+    if not impact or not timeToImpact then return "none" end
+
+    local necessity = getJumpNecessity(impact.Y, timeToImpact)
+    if necessity == "jump_now" then
+        triggerJump()
+    end
+    return necessity
+end
+
+-- ═══════════════════════════════════════════════════════════
 --  GOALKEEPER LOGIC
 -- ═══════════════════════════════════════════════════════════
 
 local function getRealPhysics()
     return {
-        gravity = Settings.CustomGravity,
-        airDensity = Settings.AirDensity / 100,
-        airFriction = Settings.AirFriction / 1000,
-        angularFriction = Settings.AngularFriction / 1000,
-        curvePower = Settings.CurvePower,
+        gravity        = Settings.CustomGravity,
+        airDensity     = Settings.AirDensity / 100,
+        airFriction    = Settings.AirFriction / 1000,
+        angularFriction= Settings.AngularFriction / 1000,
+        curvePower     = Settings.CurvePower,
         minVelForCurve = Settings.MinVelForCurve,
-        simStep = Settings.SimulationStep / 1000,
+        simStep        = Settings.SimulationStep / 1000,
     }
 end
 
@@ -213,15 +259,15 @@ local function simulateBallPhysicsStep(pos, vel, angularVel, dt, phys)
     end
 
     local totalAccel = gravityForce + dragForce + curveForce
-    local newVel = vel + totalAccel * dt
-    local newPos = pos + newVel * dt
+    local newVel     = vel + totalAccel * dt
+    local newPos     = pos + newVel * dt
     local newAngular = angularVel * (1 - phys.angularFriction * dt)
 
     return newPos, newVel, newAngular
 end
 
 local function isBallHeadingToGoal(ballPos, ballVel, goal)
-    local goalZ = goal.Position.Z
+    local goalZ  = goal.Position.Z
     local frontZ = goal.FrontZ
 
     if goalZ > 0 then
@@ -234,11 +280,11 @@ local function isBallHeadingToGoal(ballPos, ballVel, goal)
 end
 
 local function findGoalImpactPoint(startPos, startVel, startAngularVel, goal)
-    local phys = getRealPhysics()
-    local pos, vel = startPos, startVel
-    local angularVel = startAngularVel or Vector3.zero
-    local t, dt = 0, phys.simStep
-    local frontZ = goal.FrontZ
+    local phys        = getRealPhysics()
+    local pos, vel    = startPos, startVel
+    local angularVel  = startAngularVel or Vector3.zero
+    local t, dt       = 0, phys.simStep
+    local frontZ      = goal.FrontZ
     local goalHalfWidth = goal.Size.Z / 2
 
     while t < Settings.PredictionTime do
@@ -254,9 +300,9 @@ local function findGoalImpactPoint(startPos, startVel, startAngularVel, goal)
         end
 
         if crossed then
-            local ratio = (frontZ - lastPos.Z) / (pos.Z - lastPos.Z)
+            local ratio     = (frontZ - lastPos.Z) / (pos.Z - lastPos.Z)
             local intersect = lastPos:Lerp(pos, ratio)
-            local finalY = math.max(intersect.Y, 0.5)
+            local finalY    = math.max(intersect.Y, 0.5)
 
             if math.abs(intersect.X) <= goalHalfWidth + 5 then
                 return Vector3.new(intersect.X, finalY, frontZ), t
@@ -282,17 +328,17 @@ local function findGoalImpactPoint(startPos, startVel, startAngularVel, goal)
 end
 
 local function getHorizontalMovement(targetX, playerX, goal)
-    local diff = targetX - playerX
+    local diff          = targetX - playerX
     local goalHalfWidth = goal.Size.Z / 2
 
-    -- Determine which side of the goal the impact is on
+    -- Which post is on the same side as the impact
     local nearestPost = targetX >= 0 and goalHalfWidth or -goalHalfWidth
 
     if math.abs(diff) < Settings.CatchTolerance then
         -- Aligned with impact — drift toward the nearest post
         local driftDiff = nearestPost - playerX
         if math.abs(driftDiff) < Settings.CatchTolerance then
-            return false, false  -- already at the post side, stop
+            return false, false  -- already at the post, stop
         end
         if goal.Position.Z > 0 then
             return driftDiff < 0, driftDiff > 0
@@ -323,12 +369,12 @@ end
 -- ═══════════════════════════════════════════════════════════
 
 player.CharacterAdded:Connect(function(newChar)
-    character = newChar
+    character        = newChar
     humanoidRootPart = character:WaitForChild("HumanoidRootPart")
-    humanoid = character:WaitForChild("Humanoid")
+    humanoid         = character:WaitForChild("Humanoid")
     releaseAllKeys()
-    wasSaving = false
-    reactionPending = false
+    wasSaving        = false
+    reactionPending  = false
     reactionTargetBall = nil
 end)
 
@@ -337,62 +383,62 @@ end)
 -- ═══════════════════════════════════════════════════════════
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "AutoGK_UI"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = game:GetService("CoreGui")
+screenGui.Name          = "AutoGK_UI"
+screenGui.ResetOnSpawn  = false
+screenGui.Parent        = game:GetService("CoreGui")
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 500, 0, 300)
-mainFrame.Position = UDim2.new(0.5, -250, 0.5, -150)
-mainFrame.BackgroundColor3 = Color3.fromRGB(26, 32, 58)
-mainFrame.BorderSizePixel = 0
-mainFrame.Parent = screenGui
+mainFrame.Size              = UDim2.new(0, 500, 0, 300)
+mainFrame.Position          = UDim2.new(0.5, -250, 0.5, -150)
+mainFrame.BackgroundColor3  = Color3.fromRGB(26, 32, 58)
+mainFrame.BorderSizePixel   = 0
+mainFrame.Parent            = screenGui
 
 local uiCorner = Instance.new("UICorner")
 uiCorner.CornerRadius = UDim.new(0, 6)
-uiCorner.Parent = mainFrame
+uiCorner.Parent       = mainFrame
 
 local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.Size             = UDim2.new(1, 0, 0, 30)
 titleBar.BackgroundColor3 = Color3.fromRGB(38, 45, 71)
-titleBar.BorderSizePixel = 0
-titleBar.Parent = mainFrame
+titleBar.BorderSizePixel  = 0
+titleBar.Parent           = mainFrame
 
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Size = UDim2.new(1, -60, 1, 0)
-titleLabel.Position = UDim2.new(0, 10, 0, 0)
+titleLabel.Size               = UDim2.new(1, -60, 1, 0)
+titleLabel.Position           = UDim2.new(0, 10, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 16
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
-titleLabel.Text = "Auto-GK | Goalkeeper Bot"
-titleLabel.Parent = titleBar
+titleLabel.Font               = Enum.Font.GothamBold
+titleLabel.TextSize           = 16
+titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+titleLabel.TextColor3         = Color3.fromRGB(230, 230, 230)
+titleLabel.Text               = "Auto-GK | Goalkeeper Bot"
+titleLabel.Parent             = titleBar
 
 local closeButton = Instance.new("TextButton")
-closeButton.Size = UDim2.new(0, 50, 1, 0)
-closeButton.Position = UDim2.new(1, -50, 0, 0)
-closeButton.BackgroundTransparency = 1
-closeButton.Font = Enum.Font.GothamBold
-closeButton.TextSize = 16
-closeButton.TextColor3 = Color3.fromRGB(200, 80, 80)
-closeButton.Text = "X"
-closeButton.Parent = titleBar
+closeButton.Size                  = UDim2.new(0, 50, 1, 0)
+closeButton.Position              = UDim2.new(1, -50, 0, 0)
+closeButton.BackgroundTransparency= 1
+closeButton.Font                  = Enum.Font.GothamBold
+closeButton.TextSize              = 16
+closeButton.TextColor3            = Color3.fromRGB(200, 80, 80)
+closeButton.Text                  = "X"
+closeButton.Parent                = titleBar
 
 closeButton.MouseButton1Click:Connect(function()
     screenGui.Enabled = not screenGui.Enabled
 end)
 
--- drag
+-- Drag
 do
     local dragging = false
     local dragStart, startPos
 
     titleBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
+            dragging  = true
             dragStart = input.Position
-            startPos = mainFrame.Position
+            startPos  = mainFrame.Position
             input.Changed:Connect(function()
                 if input.UserInputState == Enum.UserInputState.End then
                     dragging = false
@@ -405,10 +451,8 @@ do
         if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
             local delta = input.Position - dragStart
             mainFrame.Position = UDim2.new(
-                startPos.X.Scale,
-                startPos.X.Offset + delta.X,
-                startPos.Y.Scale,
-                startPos.Y.Offset + delta.Y
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
         end
     end)
@@ -416,39 +460,39 @@ end
 
 -- Tabs
 local tabBar = Instance.new("Frame")
-tabBar.Size = UDim2.new(0, 120, 1, -30)
-tabBar.Position = UDim2.new(0, 0, 0, 30)
+tabBar.Size             = UDim2.new(0, 120, 1, -30)
+tabBar.Position         = UDim2.new(0, 0, 0, 30)
 tabBar.BackgroundColor3 = Color3.fromRGB(38, 45, 71)
-tabBar.BorderSizePixel = 0
-tabBar.Parent = mainFrame
+tabBar.BorderSizePixel  = 0
+tabBar.Parent           = mainFrame
 
 local tabList = Instance.new("UIListLayout")
 tabList.FillDirection = Enum.FillDirection.Vertical
-tabList.SortOrder = Enum.SortOrder.LayoutOrder
-tabList.Padding = UDim.new(0, 4)
-tabList.Parent = tabBar
+tabList.SortOrder     = Enum.SortOrder.LayoutOrder
+tabList.Padding       = UDim.new(0, 4)
+tabList.Parent        = tabBar
 
 local contentFrame = Instance.new("Frame")
-contentFrame.Size = UDim2.new(1, -120, 1, -30)
-contentFrame.Position = UDim2.new(0, 120, 0, 30)
+contentFrame.Size                 = UDim2.new(1, -120, 1, -30)
+contentFrame.Position             = UDim2.new(0, 120, 0, 30)
 contentFrame.BackgroundTransparency = 1
-contentFrame.Parent = mainFrame
+contentFrame.Parent               = mainFrame
 
 local pages = {}
 
 local function createPage(name)
     local page = Instance.new("Frame")
-    page.Name = name
-    page.Size = UDim2.new(1, 0, 1, 0)
+    page.Name                 = name
+    page.Size                 = UDim2.new(1, 0, 1, 0)
     page.BackgroundTransparency = 1
-    page.Visible = false
-    page.Parent = contentFrame
+    page.Visible              = false
+    page.Parent               = contentFrame
 
     local layout = Instance.new("UIListLayout")
     layout.FillDirection = Enum.FillDirection.Vertical
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 6)
-    layout.Parent = page
+    layout.SortOrder     = Enum.SortOrder.LayoutOrder
+    layout.Padding       = UDim.new(0, 6)
+    layout.Parent        = page
 
     pages[name] = page
     return page
@@ -456,19 +500,17 @@ end
 
 local function createTab(name)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 28)
+    btn.Size             = UDim2.new(1, 0, 0, 28)
     btn.BackgroundColor3 = Color3.fromRGB(26, 32, 58)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.Gotham
-    btn.TextSize = 14
-    btn.TextColor3 = Color3.fromRGB(220, 220, 220)
-    btn.Text = name
-    btn.Parent = tabBar
+    btn.BorderSizePixel  = 0
+    btn.Font             = Enum.Font.Gotham
+    btn.TextSize         = 14
+    btn.TextColor3       = Color3.fromRGB(220, 220, 220)
+    btn.Text             = name
+    btn.Parent           = tabBar
 
     btn.MouseButton1Click:Connect(function()
-        for n, p in pairs(pages) do
-            p.Visible = (n == name)
-        end
+        for n, p in pairs(pages) do p.Visible = (n == name) end
         for _, other in ipairs(tabBar:GetChildren()) do
             if other:IsA("TextButton") then
                 other.BackgroundColor3 = Color3.fromRGB(26, 32, 58)
@@ -482,50 +524,49 @@ end
 
 local function createLabel(parent, text)
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -10, 0, 20)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 13
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
-    lbl.Text = text
-    lbl.Parent = parent
+    lbl.Size                  = UDim2.new(1, -10, 0, 20)
+    lbl.BackgroundTransparency= 1
+    lbl.Font                  = Enum.Font.Gotham
+    lbl.TextSize              = 13
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.TextColor3            = Color3.fromRGB(230, 230, 230)
+    lbl.Text                  = text
+    lbl.Parent                = parent
     return lbl
 end
 
 local function createToggle(parent, text, initial, callback)
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, -10, 0, 24)
-    frame.BackgroundTransparency = 1
-    frame.Parent = parent
+    frame.Size                  = UDim2.new(1, -10, 0, 24)
+    frame.BackgroundTransparency= 1
+    frame.Parent                = parent
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -60, 1, 0)
-    lbl.Position = UDim2.new(0, 0, 0, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 13
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
-    lbl.Text = text
-    lbl.Parent = frame
+    lbl.Size                  = UDim2.new(1, -60, 1, 0)
+    lbl.Position              = UDim2.new(0, 0, 0, 0)
+    lbl.BackgroundTransparency= 1
+    lbl.Font                  = Enum.Font.Gotham
+    lbl.TextSize              = 13
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.TextColor3            = Color3.fromRGB(230, 230, 230)
+    lbl.Text                  = text
+    lbl.Parent                = frame
 
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 50, 1, 0)
-    btn.Position = UDim2.new(1, -50, 0, 0)
+    btn.Size             = UDim2.new(0, 50, 1, 0)
+    btn.Position         = UDim2.new(1, -50, 0, 0)
     btn.BackgroundColor3 = initial and Color3.fromRGB(80, 180, 80) or Color3.fromRGB(120, 40, 40)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Text = initial and "ON" or "OFF"
-    btn.Parent = frame
+    btn.BorderSizePixel  = 0
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 12
+    btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    btn.Text             = initial and "ON" or "OFF"
+    btn.Parent           = frame
 
     local state = initial
-
     btn.MouseButton1Click:Connect(function()
         state = not state
-        btn.Text = state and "ON" or "OFF"
+        btn.Text             = state and "ON" or "OFF"
         btn.BackgroundColor3 = state and Color3.fromRGB(80, 180, 80) or Color3.fromRGB(120, 40, 40)
         if callback then callback(state) end
     end)
@@ -535,31 +576,31 @@ end
 
 local function createNumberBox(parent, labelText, defaultValue, callback)
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, -10, 0, 24)
-    frame.BackgroundTransparency = 1
-    frame.Parent = parent
+    frame.Size                  = UDim2.new(1, -10, 0, 24)
+    frame.BackgroundTransparency= 1
+    frame.Parent                = parent
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -80, 1, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 13
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
-    lbl.Text = labelText
-    lbl.Parent = frame
+    lbl.Size                  = UDim2.new(1, -80, 1, 0)
+    lbl.BackgroundTransparency= 1
+    lbl.Font                  = Enum.Font.Gotham
+    lbl.TextSize              = 13
+    lbl.TextXAlignment        = Enum.TextXAlignment.Left
+    lbl.TextColor3            = Color3.fromRGB(230, 230, 230)
+    lbl.Text                  = labelText
+    lbl.Parent                = frame
 
     local box = Instance.new("TextBox")
-    box.Size = UDim2.new(0, 70, 1, 0)
-    box.Position = UDim2.new(1, -70, 0, 0)
+    box.Size             = UDim2.new(0, 70, 1, 0)
+    box.Position         = UDim2.new(1, -70, 0, 0)
     box.BackgroundColor3 = Color3.fromRGB(40, 50, 80)
-    box.BorderSizePixel = 0
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 13
-    box.TextColor3 = Color3.fromRGB(230, 230, 230)
-    box.Text = tostring(defaultValue)
+    box.BorderSizePixel  = 0
+    box.Font             = Enum.Font.Gotham
+    box.TextSize         = 13
+    box.TextColor3       = Color3.fromRGB(230, 230, 230)
+    box.Text             = tostring(defaultValue)
     box.ClearTextOnFocus = false
-    box.Parent = frame
+    box.Parent           = frame
 
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
@@ -573,12 +614,13 @@ local function createNumberBox(parent, labelText, defaultValue, callback)
     return frame
 end
 
--- Tabs & Pages
-local mainTabBtn    = createTab("Main")
+-- ── Tabs & Pages ──────────────────────────────────────────
+
+local mainTabBtn      = createTab("Main")
 local behaviourTabBtn = createTab("Behaviour")
-local jumpTabBtn    = createTab("Jump")
-local goalsTabBtn   = createTab("Goals")
-local physicsTabBtn = createTab("Physics")
+local jumpTabBtn      = createTab("Jump")
+local goalsTabBtn     = createTab("Goals")
+local physicsTabBtn   = createTab("Physics")
 
 local mainPage      = createPage("Main")
 local behaviourPage = createPage("Behaviour")
@@ -591,50 +633,41 @@ createToggle(mainPage, "Enable Auto-GK (T key)", Settings.Enabled, function(stat
     Settings.Enabled = state
     if not state then
         releaseAllKeys()
-        wasSaving = false
-        reactionPending = false
+        wasSaving          = false
+        reactionPending    = false
         reactionTargetBall = nil
-        currentStatus = "OFF"
+        currentStatus      = "OFF"
     end
 end)
 
 createLabel(mainPage, "RightShift = Show/Hide UI")
-
 local statusLabel = createLabel(mainPage, "Status: OFF")
 
 -- Behaviour Page
 createNumberBox(behaviourPage, "Prediction Time (seconds)", Settings.PredictionTime, function(v)
     Settings.PredictionTime = math.clamp(v, 1, 15)
 end)
-
 createNumberBox(behaviourPage, "Min Ball Speed", Settings.MinBallSpeed, function(v)
     Settings.MinBallSpeed = math.max(5, v)
 end)
-
 createNumberBox(behaviourPage, "Max Shooting Distance", Settings.ShootingDistance, function(v)
     Settings.ShootingDistance = math.max(50, v)
 end)
-
 createNumberBox(behaviourPage, "Catch Tolerance (studs)", Settings.CatchTolerance, function(v)
     Settings.CatchTolerance = math.max(0, v)
 end)
-
 createNumberBox(behaviourPage, "Center Tolerance (studs)", Settings.CenterTolerance, function(v)
     Settings.CenterTolerance = math.max(0, v)
 end)
-
 createNumberBox(behaviourPage, "Reset Delay (seconds)", Settings.ResetDelay, function(v)
     Settings.ResetDelay = math.max(0, v)
 end)
-
 createNumberBox(behaviourPage, "Reaction Time Min (ms)", Settings.ReactionTimeMin, function(v)
     Settings.ReactionTimeMin = math.clamp(v, 0, Settings.ReactionTimeMax)
 end)
-
 createNumberBox(behaviourPage, "Reaction Time Max (ms)", Settings.ReactionTimeMax, function(v)
     Settings.ReactionTimeMax = math.max(Settings.ReactionTimeMin, v)
 end)
-
 createToggle(behaviourPage, "Auto-Center Enabled", Settings.AutoCenterEnabled, function(state)
     Settings.AutoCenterEnabled = state
 end)
@@ -643,17 +676,17 @@ end)
 createToggle(jumpPage, "Enable Auto-Jump", Settings.AutoJumpEnabled, function(state)
     Settings.AutoJumpEnabled = state
 end)
-
-createNumberBox(jumpPage, "Jump Threshold (Y height)", Settings.JumpThreshold, function(v)
-    Settings.JumpThreshold = math.max(0, v)
-end)
-
 createNumberBox(jumpPage, "Jump Cooldown (seconds)", Settings.JumpCooldown, function(v)
     Settings.JumpCooldown = math.max(0, v)
 end)
-
-createNumberBox(jumpPage, "Jump Anticipation (seconds)", Settings.JumpAnticipation, function(v)
-    Settings.JumpAnticipation = math.max(0, v)
+createNumberBox(jumpPage, "Standing Reach (studs)", Settings.PlayerStandingReach, function(v)
+    Settings.PlayerStandingReach = math.max(0, v)
+end)
+createNumberBox(jumpPage, "Jump Reach (studs)", Settings.PlayerJumpReach, function(v)
+    Settings.PlayerJumpReach = math.max(Settings.PlayerStandingReach, v)
+end)
+createNumberBox(jumpPage, "Jump Rise Time (seconds)", Settings.JumpRiseTime, function(v)
+    Settings.JumpRiseTime = math.max(0.1, v)
 end)
 
 -- Goals Page
@@ -675,17 +708,17 @@ createNumberBox(goalsPage, "Home Size Y (Height)", Settings.HomeGoalSizeY, funct
 createNumberBox(goalsPage, "Home Size Z (Width)",  Settings.HomeGoalSizeZ, function(v) Settings.HomeGoalSizeZ = v rebuildGoals() end)
 
 -- Physics Page
-createNumberBox(physicsPage, "Custom Gravity",           Settings.CustomGravity,     function(v) Settings.CustomGravity = v end)
-createNumberBox(physicsPage, "Air Density (x100)",       Settings.AirDensity,        function(v) Settings.AirDensity = v end)
-createNumberBox(physicsPage, "Air Friction (x1000)",     Settings.AirFriction,       function(v) Settings.AirFriction = v end)
-createNumberBox(physicsPage, "Angular Friction (x1000)", Settings.AngularFriction,   function(v) Settings.AngularFriction = v end)
-createNumberBox(physicsPage, "Curve Power",              Settings.CurvePower,        function(v) Settings.CurvePower = v end)
-createNumberBox(physicsPage, "Min Vel for Curve",        Settings.MinVelForCurve,    function(v) Settings.MinVelForCurve = v end)
-createNumberBox(physicsPage, "Simulation Step (x1000)",  Settings.SimulationStep,    function(v) Settings.SimulationStep = math.max(1, v) end)
+createNumberBox(physicsPage, "Custom Gravity",           Settings.CustomGravity,   function(v) Settings.CustomGravity   = v end)
+createNumberBox(physicsPage, "Air Density (x100)",       Settings.AirDensity,      function(v) Settings.AirDensity      = v end)
+createNumberBox(physicsPage, "Air Friction (x1000)",     Settings.AirFriction,     function(v) Settings.AirFriction     = v end)
+createNumberBox(physicsPage, "Angular Friction (x1000)", Settings.AngularFriction, function(v) Settings.AngularFriction = v end)
+createNumberBox(physicsPage, "Curve Power",              Settings.CurvePower,      function(v) Settings.CurvePower      = v end)
+createNumberBox(physicsPage, "Min Vel for Curve",        Settings.MinVelForCurve,  function(v) Settings.MinVelForCurve  = v end)
+createNumberBox(physicsPage, "Simulation Step (x1000)",  Settings.SimulationStep,  function(v) Settings.SimulationStep  = math.max(1, v) end)
 
 -- Default visible tab
-pages["Main"].Visible = true
-mainTabBtn.BackgroundColor3 = Color3.fromRGB(60, 80, 140)
+pages["Main"].Visible        = true
+mainTabBtn.BackgroundColor3  = Color3.fromRGB(60, 80, 140)
 
 -- Keybinds
 UserInputService.InputBegan:Connect(function(input, gp)
@@ -694,10 +727,10 @@ UserInputService.InputBegan:Connect(function(input, gp)
         Settings.Enabled = not Settings.Enabled
         if not Settings.Enabled then
             releaseAllKeys()
-            wasSaving = false
-            reactionPending = false
+            wasSaving          = false
+            reactionPending    = false
             reactionTargetBall = nil
-            currentStatus = "OFF"
+            currentStatus      = "OFF"
         end
     elseif input.KeyCode == Enum.KeyCode.RightShift then
         screenGui.Enabled = not screenGui.Enabled
@@ -720,30 +753,36 @@ RunService.Heartbeat:Connect(function()
     end
 
     if not character or not character.Parent then
-        character = player.Character
+        character        = player.Character
         if not character then return end
         humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
-        humanoid = character:FindFirstChild("Humanoid")
+        humanoid         = character:FindFirstChild("Humanoid")
         if not humanoidRootPart or not humanoid then return end
     end
 
     activeGoal = getNearestGoal()
-    local ball = findActiveBall()
+    local ball      = findActiveBall()
     local playerPos = humanoidRootPart.Position
-    local now = tick()
+    local now       = tick()
 
-    -- ── If we're in the reaction window, just show REACTING and wait ──
+    -- ── Reaction window ───────────────────────────────────
     if reactionPending then
-        -- Cancel reaction if the ball is gone or no longer a threat
-        if not ball or not reactionTargetBall or not reactionTargetBall.Parent
-            or not isBallHeadingToGoal(reactionTargetBall.Position, reactionTargetBall.AssemblyLinearVelocity, activeGoal) then
-            reactionPending = false
+        local ballGone = not ball
+            or not reactionTargetBall
+            or not reactionTargetBall.Parent
+            or not isBallHeadingToGoal(
+                reactionTargetBall.Position,
+                reactionTargetBall.AssemblyLinearVelocity,
+                activeGoal)
+
+        if ballGone then
+            reactionPending    = false
             reactionTargetBall = nil
         elseif (now - reactionStartTime) >= reactionDelay then
-            -- Reaction window elapsed — commit to the save
+            -- Reaction elapsed — commit to the save
             reactionPending = false
-            local impact = reactionImpact
-            local timeToImpact = reactionTimeToImpact
+            local impact        = reactionImpact
+            local timeToImpact  = reactionTimeToImpact
 
             if impact then
                 currentImpactPoint = impact
@@ -751,22 +790,21 @@ RunService.Heartbeat:Connect(function()
                 setMovementKey("A", a)
                 setMovementKey("D", d)
 
-                if Settings.AutoJumpEnabled and impact.Y > Settings.JumpThreshold then
-                    if timeToImpact and timeToImpact <= Settings.JumpAnticipation + 0.5 then
-                        triggerJump()
-                    end
-                end
-
-                lastShotTime = now
-                wasSaving = true
+                local jumpResult = evaluateJump(impact, timeToImpact)
+                lastShotTime  = now
+                wasSaving     = true
                 currentStatus = (a or d) and "SAVING" or "POSITIONED"
 
-                if Settings.AutoJumpEnabled and impact.Y > Settings.JumpThreshold then
+                if jumpResult == "jump_now" then
                     currentStatus = currentStatus .. " [JUMP Y:" .. string.format("%.1f", impact.Y) .. "]"
+                elseif jumpResult == "too_early" then
+                    currentStatus = currentStatus .. " [JUMP WAIT Y:" .. string.format("%.1f", impact.Y) .. "]"
+                elseif jumpResult == "unreachable" then
+                    currentStatus = currentStatus .. " [OUT OF REACH]"
                 end
             end
         else
-            -- Still waiting out reaction time
+            -- Still waiting
             currentStatus = "REACTING"
             statusUpdateCounter += 1
             if statusUpdateCounter % 10 == 0 then
@@ -776,7 +814,7 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- ── Normal detection ──
+    -- ── Normal detection ──────────────────────────────────
     if ball then
         local bPos = ball.Position
         local bVel = ball.AssemblyLinearVelocity
@@ -785,33 +823,32 @@ RunService.Heartbeat:Connect(function()
         if isBallHeadingToGoal(bPos, bVel, activeGoal) then
             local impact, timeToImpact = findGoalImpactPoint(bPos, bVel, bAng, activeGoal)
             if impact then
-                -- Only start a new reaction window if this is a new threat
                 if not wasSaving and not reactionPending then
-                    reactionPending = true
-                    reactionTargetBall = ball
-                    reactionStartTime = now
-                    reactionDelay = math.random(Settings.ReactionTimeMin, Settings.ReactionTimeMax) / 1000
-                    reactionImpact = impact
+                    -- New threat — start reaction window
+                    reactionPending      = true
+                    reactionTargetBall   = ball
+                    reactionStartTime    = now
+                    reactionDelay        = math.random(Settings.ReactionTimeMin, Settings.ReactionTimeMax) / 1000
+                    reactionImpact       = impact
                     reactionTimeToImpact = timeToImpact
-                    currentStatus = "REACTING"
+                    currentStatus        = "REACTING"
                 elseif wasSaving then
-                    -- Already saving — keep tracking updated impact
+                    -- Already saving — track updated impact every frame
                     currentImpactPoint = impact
                     local a, d = getHorizontalMovement(impact.X, playerPos.X, activeGoal)
                     setMovementKey("A", a)
                     setMovementKey("D", d)
 
-                    if Settings.AutoJumpEnabled and impact.Y > Settings.JumpThreshold then
-                        if timeToImpact and timeToImpact <= Settings.JumpAnticipation + 0.5 then
-                            triggerJump()
-                        end
-                    end
-
-                    lastShotTime = now
+                    local jumpResult = evaluateJump(impact, timeToImpact)
+                    lastShotTime  = now
                     currentStatus = (a or d) and "SAVING" or "POSITIONED"
 
-                    if Settings.AutoJumpEnabled and impact.Y > Settings.JumpThreshold then
+                    if jumpResult == "jump_now" then
                         currentStatus = currentStatus .. " [JUMP Y:" .. string.format("%.1f", impact.Y) .. "]"
+                    elseif jumpResult == "too_early" then
+                        currentStatus = currentStatus .. " [JUMP WAIT Y:" .. string.format("%.1f", impact.Y) .. "]"
+                    elseif jumpResult == "unreachable" then
+                        currentStatus = currentStatus .. " [OUT OF REACH]"
                     end
                 end
 
