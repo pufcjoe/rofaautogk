@@ -283,7 +283,24 @@ end
 
 local function getHorizontalMovement(targetX, playerX, goal)
     local diff = targetX - playerX
-    if math.abs(diff) < Settings.CatchTolerance then return false, false end
+    local goalHalfWidth = goal.Size.Z / 2
+
+    -- Determine which side of the goal the impact is on
+    local nearestPost = targetX >= 0 and goalHalfWidth or -goalHalfWidth
+
+    if math.abs(diff) < Settings.CatchTolerance then
+        -- Aligned with impact — drift toward the nearest post
+        local driftDiff = nearestPost - playerX
+        if math.abs(driftDiff) < Settings.CatchTolerance then
+            return false, false  -- already at the post side, stop
+        end
+        if goal.Position.Z > 0 then
+            return driftDiff < 0, driftDiff > 0
+        else
+            return driftDiff > 0, driftDiff < 0
+        end
+    end
+
     if goal.Position.Z > 0 then
         return diff < 0, diff > 0
     else
